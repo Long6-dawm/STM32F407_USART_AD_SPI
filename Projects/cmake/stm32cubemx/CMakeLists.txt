@@ -10,6 +10,11 @@ set(MX_Defines_Syms
 
 set(MX_Include_Dirs
     ${CMAKE_SOURCE_DIR}/../Core/Inc
+    ${CMAKE_SOURCE_DIR}/../USER/config
+    ${CMAKE_SOURCE_DIR}/../USER/protocol
+    ${CMAKE_SOURCE_DIR}/../USER/drivers
+    ${CMAKE_SOURCE_DIR}/../USER/bsp
+    ${CMAKE_SOURCE_DIR}/../USER/app
     ${CMAKE_SOURCE_DIR}/../Drivers/STM32F4xx_HAL_Driver/Inc
     ${CMAKE_SOURCE_DIR}/../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy
     ${CMAKE_SOURCE_DIR}/../Drivers/CMSIS/Device/ST/STM32F4xx/Include
@@ -23,10 +28,14 @@ set(MX_Application_Src
     ${CMAKE_SOURCE_DIR}/../Core/Src/spi.c
     ${CMAKE_SOURCE_DIR}/../Core/Src/tim.c
     ${CMAKE_SOURCE_DIR}/../Core/Src/usart.c
-    ${CMAKE_SOURCE_DIR}/../Core/Src/hmi_tjc.c
     ${CMAKE_SOURCE_DIR}/../Core/Src/stm32f4xx_it.c
     ${CMAKE_SOURCE_DIR}/../Core/Src/stm32f4xx_hal_msp.c
     ${CMAKE_SOURCE_DIR}/../Core/Src/system_stm32f4xx.c
+    ${CMAKE_SOURCE_DIR}/../USER/drivers/hmi_tjc.c
+    ${CMAKE_SOURCE_DIR}/../USER/bsp/screen_key.c
+    ${CMAKE_SOURCE_DIR}/../USER/app/screen_view.c
+    ${CMAKE_SOURCE_DIR}/../USER/app/screen_test.c
+    ${CMAKE_SOURCE_DIR}/../USER/app/screen_app.c
     ${CMAKE_SOURCE_DIR}/../Src/sysmem.c
     ${CMAKE_SOURCE_DIR}/../Src/syscalls.c
     ${CMAKE_SOURCE_DIR}/startup_stm32f407xx.s

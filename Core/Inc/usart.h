@@ -1,25 +1,41 @@
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file    usart.h
-  * @brief   This file contains all the functions prototypes for the USART1
-  *          driver (TJC serial HMI).
+  * @brief   USART1 configuration for the TJC serial HMI.
   ******************************************************************************
   */
-#ifndef __USART_H
-#define __USART_H
+/* USER CODE END Header */
+/* Define to prevent recursive inclusion -------------------------------------*/
+#ifndef __USART_H__
+#define __USART_H__
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "stm32f4xx_hal.h"
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
 
 extern UART_HandleTypeDef huart1;
 
+/* USER CODE BEGIN Private defines */
+
+/* USER CODE END Private defines */
+
 void MX_USART1_UART_Init(void);
+
+/* USER CODE BEGIN Prototypes */
+
+/* USER CODE END Prototypes */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __USART_H */
+#endif /* __USART_H__ */
+
