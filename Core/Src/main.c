@@ -24,6 +24,7 @@
 #include "gpio.h"
 #include "usart.h"
 #include "hmi_tjc.h"
+#include "wave_table.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -336,6 +337,36 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
   HMI_GotoPage("page0");
   HMI_ClearWave("s_wave", 255u);
   HMI_SetText("T_num", "3");
+
+  /* 测试模式：先显示预置 wave_table 数据（768 点 / 3 周期） */
+  {
+    uint8_t tpx[WAVE_TABLE_LENGTH];
+    uint16_t i;
+    uint16_t tmax = 1u;
+    uint32_t tspan;
+    uint16_t tcount = WAVE_TABLE_LENGTH;
+    uint16_t tstart = 0u;
+
+    for (i = 0u; i < WAVE_TABLE_LENGTH; i++)
+    {
+      if (g_wave_table[i] > tmax) { tmax = g_wave_table[i]; }
+    }
+    tspan = (uint32_t)tmax;
+
+    if (s_wave_periods == 1u)
+    {
+      tcount = WAVE_TABLE_PERIOD_POINTS;
+      tstart = WAVE_TABLE_LENGTH / 3u;
+    }
+    for (i = 0u; i < tcount; i++)
+    {
+      uint32_t y = ((uint32_t)g_wave_table[tstart + i] * SCREEN_CURVE_HEIGHT) / tspan;
+      if (y > SCREEN_CURVE_HEIGHT) { y = SCREEN_CURVE_HEIGHT; }
+      tpx[i] = (uint8_t)y;
+    }
+    HMI_ClearWave(SCREEN_WAVE_CTRL, 255u);
+    HMI_Addt_Send(SCREEN_WAVE_CTRL, 0u, tpx, tcount);
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
