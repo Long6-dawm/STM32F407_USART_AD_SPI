@@ -85,6 +85,7 @@ static uint8_t s_key_last_raw = 1u;
 static uint32_t s_key_last_change_ms = 0u;
 static uint8_t s_display_ready = 0u;     /* 一帧数据已就绪待刷屏 */
 static uint32_t s_last_refresh_ms = 0u;  /* TJC 刷屏节流 */
+static uint8_t s_has_real_data = 0u;     /* 是否已有真实 ADC 数据（否则用 wave_table 测试数据） */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -149,6 +150,8 @@ static void ConfigEquivalentSampling(uint32_t f0_hz)
   uint32_t arr2;
   uint32_t arr1;
 
+  /* 等效采样率范围保护：fs = f0*256/255，限 1kHz ~ 10MHz，
+     避免异常基频值导致 ARR 下溢/溢出写坏定时器 */
   if (f0_hz == 0u)
   {
     return;
@@ -156,9 +159,13 @@ static void ConfigEquivalentSampling(uint32_t f0_hz)
 
   fs = (uint32_t)(((uint64_t)f0_hz * EQ_POINTS_PER_PERIOD) /
                   (EQ_POINTS_PER_PERIOD - 1u));
-  if (fs == 0u)
+  if (fs < 1000u)
   {
-    return;
+    fs = 1000u;
+  }
+  if (fs > 10000000u)
+  {
+    fs = 10000000u;
   }
 
   /* TIM2：APB1 定时器钟 84MHz，div=2（与原 42MHz 计数钟一致），32 位 ARR */
@@ -195,6 +202,41 @@ static void ConfigEquivalentSampling(uint32_t f0_hz)
 #define SCREEN_CURVE_HEIGHT 210u
 #define SCREEN_WAVE_CTRL "s_wave"
 #define SCREEN_KEY_DEBOUNCE_MS 30u
+#define SCREEN_TEST_REFRESH_MS 300u
+
+/**
+  * @brief  按当前 s_wave_periods 显示预置 wave_table 测试数据。
+  *         3 周期：768 点全部；1 周期：取中间 256 点。
+  */
+static void SendWaveTableDisplay(void)
+{
+  uint8_t tpx[WAVE_TABLE_LENGTH];
+  uint16_t i;
+  uint16_t tmax = 1u;
+  uint32_t tspan;
+  uint16_t tcount = WAVE_TABLE_LENGTH;
+  uint16_t tstart = 0u;
+
+  for (i = 0u; i < WAVE_TABLE_LENGTH; i++)
+  {
+    if (g_wave_table[i] > tmax) { tmax = g_wave_table[i]; }
+  }
+  tspan = (uint32_t)tmax;
+
+  if (s_wave_periods == 1u)
+  {
+    tcount = WAVE_TABLE_PERIOD_POINTS;
+    tstart = WAVE_TABLE_LENGTH / 3u;
+  }
+  for (i = 0u; i < tcount; i++)
+  {
+    uint32_t y = ((uint32_t)g_wave_table[tstart + i] * SCREEN_CURVE_HEIGHT) / tspan;
+    if (y > SCREEN_CURVE_HEIGHT) { y = SCREEN_CURVE_HEIGHT; }
+    tpx[i] = (uint8_t)y;
+  }
+  HMI_ClearWave(SCREEN_WAVE_CTRL, 255u);
+  HMI_Addt_Send(SCREEN_WAVE_CTRL, 0u, tpx, tcount);
+}
 
 /**
   * @brief  将采集数据归一化并发送到 TJC 屏（addt 协议）。
@@ -261,9 +303,11 @@ static void ScreenKey_Scan(uint32_t now_ms)
     s_key_stable_level = raw;
     if (s_key_stable_level == 0u)
     {
-      /* 按下：切换显示周期 */
+      /* 按下：切换显示周期，并立即触发重绘 */
       s_wave_periods = (s_wave_periods == 1u) ? 3u : 1u;
       HMI_SetText("T_num", (s_wave_periods == 1u) ? "1" : "3");
+      s_display_ready = 1u;
+      s_last_refresh_ms = 0u;
     }
   }
 }
@@ -333,40 +377,16 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
 	__HAL_TIM_SET_COUNTER(&htim1, tim1_read_phase_offset);
 	__HAL_TIM_ENABLE(&htim1);
 
-  /* TJC 屏初始化 */
+  /* TJC 屏初始化：等待屏上电初始化完成再发命令（对齐屏工程 SCREEN_HMI_BOOT_DELAY_MS） */
+  HAL_Delay(500);
   HMI_GotoPage("page0");
   HMI_ClearWave("s_wave", 255u);
   HMI_SetText("T_num", "3");
 
   /* 测试模式：先显示预置 wave_table 数据（768 点 / 3 周期） */
-  {
-    uint8_t tpx[WAVE_TABLE_LENGTH];
-    uint16_t i;
-    uint16_t tmax = 1u;
-    uint32_t tspan;
-    uint16_t tcount = WAVE_TABLE_LENGTH;
-    uint16_t tstart = 0u;
-
-    for (i = 0u; i < WAVE_TABLE_LENGTH; i++)
-    {
-      if (g_wave_table[i] > tmax) { tmax = g_wave_table[i]; }
-    }
-    tspan = (uint32_t)tmax;
-
-    if (s_wave_periods == 1u)
-    {
-      tcount = WAVE_TABLE_PERIOD_POINTS;
-      tstart = WAVE_TABLE_LENGTH / 3u;
-    }
-    for (i = 0u; i < tcount; i++)
-    {
-      uint32_t y = ((uint32_t)g_wave_table[tstart + i] * SCREEN_CURVE_HEIGHT) / tspan;
-      if (y > SCREEN_CURVE_HEIGHT) { y = SCREEN_CURVE_HEIGHT; }
-      tpx[i] = (uint8_t)y;
-    }
-    HMI_ClearWave(SCREEN_WAVE_CTRL, 255u);
-    HMI_Addt_Send(SCREEN_WAVE_CTRL, 0u, tpx, tcount);
-  }
+  SendWaveTableDisplay();
+  s_display_ready = 1u;
+  s_last_refresh_ms = 0u;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -375,14 +395,22 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
   {
     ScreenKey_Scan(HAL_GetTick());
 
-    /* 数据就绪：转换完成后节流刷屏（TJC addt 发送耗时约 70ms，避免每帧阻塞） */
+    /* 数据就绪：节流刷屏（TJC addt 发送耗时约 70ms，避免每帧阻塞）。
+       无真实数据时用 wave_table 测试数据周期性刷新，保证按键切周期立即可见。 */
     if (s_display_ready == 1u)
     {
       s_display_ready = 0u;
-      if ((HAL_GetTick() - s_last_refresh_ms) >= 300u)
+      if ((HAL_GetTick() - s_last_refresh_ms) >= SCREEN_TEST_REFRESH_MS)
       {
         s_last_refresh_ms = HAL_GetTick();
-        SendDisplayWave();
+        if (s_has_real_data == 0u)
+        {
+          SendWaveTableDisplay();
+        }
+        else
+        {
+          SendDisplayWave();
+        }
       }
     }
 		
@@ -416,6 +444,7 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
   }
 	//完成转化
 	//准备发送
+  s_has_real_data = 1u;
   data_1_flag=1;
   s_display_ready=1;
     }
