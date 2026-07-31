@@ -22,6 +22,8 @@
 #include "spi.h"
 #include "tim.h"
 #include "gpio.h"
+#include "usart.h"
+#include "hmi_tjc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -41,6 +43,11 @@
 /* TIM1 读时刻相对 TIM2(ADC 时钟)上升沿的滞后：取 TIM1 ARR/2=21，
    使 DMA 读落在 ADC 时钟周期中点(~250ns)，避开 ADC 输出翻转窗 */
 #define TIM1_READ_PHASE_OFFSET 21
+
+/* 等效采样：1 个等效周期采样点数 */
+#define EQ_POINTS_PER_PERIOD 256u
+/* 显示用点数 = 3 个等效周期 */
+#define EQ_DISPLAY_POINTS (3u * EQ_POINTS_PER_PERIOD)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -67,6 +74,16 @@ __attribute__((aligned(16))) uint16_t adc_data_3[FFT_SIZE];
 __attribute__((aligned(32))) uint32_t rxBuffer[6]={0};
 
 volatile uint8_t a=0;
+/* TIM1 读相位偏移（等效采样时随 ARR 更新） */
+volatile uint16_t tim1_read_phase_offset = TIM1_READ_PHASE_OFFSET;
+
+/* TJC 显示状态 */
+static uint8_t s_wave_periods = 3u;      /* 显示 1 周期 / 3 周期 */
+static uint8_t s_key_stable_level = 1u;  /* 按键稳定电平（上拉=1 未按下） */
+static uint8_t s_key_last_raw = 1u;
+static uint32_t s_key_last_change_ms = 0u;
+static uint8_t s_display_ready = 0u;     /* 一帧数据已就绪待刷屏 */
+static uint32_t s_last_refresh_ms = 0u;  /* TJC 刷屏节流 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -108,6 +125,148 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/**
+  * @brief  从 H7 返回的 rxBuffer 中解析基频值（单位 Hz）。
+  *         当前 H7 只发占位数据，此函数为占位实现，待与 H7 协议对齐后修改。
+  *         占位约定：rxBuffer[0] 为 uint32，直接表示基频(Hz)。
+  * @retval 基频(Hz)，非法时返回 0
+  */
+static uint32_t GetBaseFrequencyHz(void)
+{
+  return (uint32_t)rxBuffer[0];
+}
+
+/**
+  * @brief  根据基频 f0 配置等效采样率 fs = f0*256/255。
+  *         每个采样点相位前进 1/256 周期 => 1 个等效周期 256 点。
+  *         TIM2 = AD9238 采样时钟，TIM1 = 同频率触发 DMA 读 GPIOF。
+  * @param  f0_hz 基频（Hz）
+  */
+static void ConfigEquivalentSampling(uint32_t f0_hz)
+{
+  uint32_t fs;
+  uint32_t arr2;
+  uint32_t arr1;
+
+  if (f0_hz == 0u)
+  {
+    return;
+  }
+
+  fs = (uint32_t)(((uint64_t)f0_hz * EQ_POINTS_PER_PERIOD) /
+                  (EQ_POINTS_PER_PERIOD - 1u));
+  if (fs == 0u)
+  {
+    return;
+  }
+
+  /* TIM2：APB1 定时器钟 84MHz，div=2（与原 42MHz 计数钟一致），32 位 ARR */
+  uint32_t div2 = 2u;
+  arr2 = (84000000U / div2 / fs) - 1u;
+  TIM2->PSC = div2 - 1u;
+  TIM2->ARR = arr2;
+  TIM2->EGR |= TIM_EGR_UG;
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (TIM2->ARR + 1u) * 2u / 3u);
+
+  /* TIM1：APB2 定时器钟 168MHz，16 位 ARR（<=65535）。
+     div 为分频系数（PSC 寄存器值 = div-1），计数钟 = 168MHz/div。
+     初始 div=2（与原 84MHz 计数钟一致），低频时增大 div 保证 ARR 落在 16 位范围。 */
+  uint32_t div = 2u;
+  arr1 = (168000000U / div / fs) - 1u;
+  while ((arr1 > 65535u) && (div < 65536u))
+  {
+    div++;
+    arr1 = (168000000U / div / fs) - 1u;
+  }
+  if (arr1 > 65535u)
+  {
+    arr1 = 65535u;
+  }
+  TIM1->PSC = div - 1u;
+  TIM1->ARR = arr1;
+  TIM1->EGR |= TIM_EGR_UG;
+
+  /* 保持 DMA 读落在 ADC 时钟周期中点 */
+  tim1_read_phase_offset = (TIM1->ARR + 1u) / 2u;
+}
+
+/* TJC 屏曲线高度（与屏工程 SCREEN_CURVE_HEIGHT 一致） */
+#define SCREEN_CURVE_HEIGHT 210u
+#define SCREEN_WAVE_CTRL "s_wave"
+#define SCREEN_KEY_DEBOUNCE_MS 30u
+
+/**
+  * @brief  将采集数据归一化并发送到 TJC 屏（addt 协议）。
+  *         按当前 s_wave_periods 显示 768 点(3 周期) 或取中间 256 点(1 周期)。
+  */
+static void SendDisplayWave(void)
+{
+  uint16_t pixel[EQ_DISPLAY_POINTS];
+  uint8_t  px[EQ_DISPLAY_POINTS];
+  uint16_t count = EQ_DISPLAY_POINTS;
+  uint16_t start = 0u;
+  uint16_t i;
+  int32_t  vmax = -32767;
+  int32_t  vmin = 32767;
+  uint32_t span;
+
+  if (s_wave_periods == 1u)
+  {
+    /* 1 周期：取 3 周期数据中间 1/3 */
+    count = EQ_POINTS_PER_PERIOD;
+    start = EQ_DISPLAY_POINTS / 3u;
+  }
+
+  for (i = 0u; i < count; i++)
+  {
+    int32_t v = (int16_t)adc_data_3[start + i];
+    if (v > vmax) { vmax = v; }
+    if (v < vmin) { vmin = v; }
+    pixel[i] = (uint16_t)v;
+  }
+
+  span = (uint32_t)(vmax - vmin);
+  if (span == 0u) { span = 1u; }
+
+  for (i = 0u; i < count; i++)
+  {
+    int32_t y = (int32_t)(((uint32_t)(pixel[i] - (uint16_t)vmin) * SCREEN_CURVE_HEIGHT) / span);
+    if (y < 0) { y = 0; }
+    if (y > (int32_t)SCREEN_CURVE_HEIGHT) { y = SCREEN_CURVE_HEIGHT; }
+    px[i] = (uint8_t)y;
+  }
+
+  HMI_ClearWave(SCREEN_WAVE_CTRL, 255u);
+  HMI_Addt_Send(SCREEN_WAVE_CTRL, 0u, px, count);
+}
+
+/**
+  * @brief  PE0 按键轮询消抖（低电平按下），切换 1 周期 / 3 周期显示。
+  * @param  now_ms 当前毫秒时间戳
+  */
+static void ScreenKey_Scan(uint32_t now_ms)
+{
+  uint8_t raw = (HAL_GPIO_ReadPin(Single_MCU_GPIO_Port, Single_MCU_Pin) == GPIO_PIN_RESET) ? 0u : 1u;
+
+  if (raw != s_key_last_raw)
+  {
+    s_key_last_raw = raw;
+    s_key_last_change_ms = now_ms;
+    return;
+  }
+
+  if ((raw != s_key_stable_level) && ((now_ms - s_key_last_change_ms) >= SCREEN_KEY_DEBOUNCE_MS))
+  {
+    s_key_stable_level = raw;
+    if (s_key_stable_level == 0u)
+    {
+      /* 按下：切换显示周期 */
+      s_wave_periods = (s_wave_periods == 1u) ? 3u : 1u;
+      HMI_SetText("T_num", (s_wave_periods == 1u) ? "1" : "3");
+    }
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -143,6 +302,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_SPI1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOG, GPIO_PIN_15, GPIO_PIN_RESET);        //始终开启片选
 
@@ -169,20 +329,37 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
 	__NOP();
 	__NOP();__NOP();__NOP();__NOP();
 
-	__HAL_TIM_SET_COUNTER(&htim1, TIM1_READ_PHASE_OFFSET);
+	__HAL_TIM_SET_COUNTER(&htim1, tim1_read_phase_offset);
 	__HAL_TIM_ENABLE(&htim1);
+
+  /* TJC 屏初始化 */
+  HMI_GotoPage("page0");
+  HMI_ClearWave("s_wave", 255u);
+  HMI_SetText("T_num", "3");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    ScreenKey_Scan(HAL_GetTick());
+
+    /* 数据就绪：转换完成后节流刷屏（TJC addt 发送耗时约 70ms，避免每帧阻塞） */
+    if (s_display_ready == 1u)
+    {
+      s_display_ready = 0u;
+      if ((HAL_GetTick() - s_last_refresh_ms) >= 300u)
+      {
+        s_last_refresh_ms = HAL_GetTick();
+        SendDisplayWave();
+      }
+    }
 		
     if(ad9238_ok_flag==1){
       ad9238_ok_flag=0;
  __HAL_TIM_DISABLE(&htim1);
 	__HAL_TIM_DISABLE(&htim2);
-	__HAL_TIM_SET_COUNTER(&htim2, 0);__HAL_TIM_SET_COUNTER(&htim1, TIM1_READ_PHASE_OFFSET);
+	__HAL_TIM_SET_COUNTER(&htim2, 0);__HAL_TIM_SET_COUNTER(&htim1, tim1_read_phase_offset);
 
   if(buma==1){
     for (uint16_t i = 0; i < FFT_SIZE; i++)
@@ -209,6 +386,7 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
 	//完成转化
 	//准备发送
   data_1_flag=1;
+  s_display_ready=1;
     }
 
     //开始发射
@@ -229,7 +407,14 @@ __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
 if(rx_cplt_flag==1){
       rx_cplt_flag=0;
       //接收完成
-	//处理接收值
+	//处理接收值：根据 H7 返回的基频重新配置等效采样率
+	{
+	  uint32_t f0 = GetBaseFrequencyHz();
+	  if (f0 > 0u)
+	  {
+	    ConfigEquivalentSampling(f0);
+	  }
+	}
 	rebegin_enable_flag=1;
     }
 
@@ -239,7 +424,7 @@ if(rx_cplt_flag==1){
       __HAL_TIM_ENABLE(&htim2);
       __NOP();
       __NOP();__NOP();__NOP();__NOP();
-      __HAL_TIM_SET_COUNTER(&htim1, TIM1_READ_PHASE_OFFSET);
+      __HAL_TIM_SET_COUNTER(&htim1, tim1_read_phase_offset);
       __HAL_TIM_ENABLE(&htim1);
 
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);
@@ -274,12 +459,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 6;
   RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;

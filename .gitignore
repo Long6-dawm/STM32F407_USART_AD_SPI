@@ -1,4 +1,4 @@
-.embeddedskills/
+build/
 MDK-ARM/.vscode/
 MDK-ARM/DebugConfig/
 MDK-ARM/EventRecorderStub.scvd
@@ -18,6 +18,7 @@ MDK-ARM/*.bak
 MDK-ARM/*.uvguix.*
 MDK-ARM/*.uvopt
 MDK-ARM/RTE/
+.embeddedskills/
 *.o
 *.d
 *.lst

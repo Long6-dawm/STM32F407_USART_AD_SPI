@@ -59,7 +59,9 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 
 /* USER CODE BEGIN Private defines */
-
+/* 按键：PE0，输入+上拉，低电平按下，用于切换显示 1 周期 / 3 周期 */
+#define Single_MCU_Pin GPIO_PIN_0
+#define Single_MCU_GPIO_Port GPIOE
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
